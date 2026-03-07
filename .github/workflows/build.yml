@@ -1,0 +1,143 @@
+name: Gardendless Android Auto Build
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天UTC 0点运行
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout gardendless-android
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Get pvzg_site Latest Commit
+        id: get-pvzg-site-commit
+        run: |
+          # 获取最新提交SHA
+          COMMIT_SHA=$(curl -s https://api.github.com/repos/Gzh0821/pvzg_site/commits/main | jq -r '.sha')
+
+          # 检查是否成功获取
+          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" == "null" ]; then
+            echo "❌ 错误：无法获取最新的提交哈希"
+            echo "请检查："
+            echo "1. 仓库地址是否正确：Gzh0821/pvzg_site"
+            echo "2. main分支是否存在"
+            echo "3. GitHub API访问是否正常"
+            exit 1
+          fi
+
+          echo "✅ 成功获取提交哈希: ${COMMIT_SHA:0:8}..."
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Check Last Processed Commit
+        id: check-commit
+        run: |
+          if [ -f "last_commit.txt" ]; then
+            LAST_COMMIT=$(cat last_commit.txt)
+            if [ "$LAST_COMMIT" == "${{ steps.get-pvzg-site-commit.outputs.commit_sha }}" ]; then
+              echo "No new commit, exiting."
+              exit 1
+            fi
+          fi
+          echo "Proceeding with new commit."
+
+      - name: Clone pvzg_site
+        uses: actions/checkout@v4
+        with:
+          repository: Gzh0821/pvzg_site
+          path: pvzg_site
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: pvzg_site/package.json
+          run_install: false
+
+      - name: Build pvzg_site
+        run: |
+          cd pvzg_site
+          pnpm install
+          pnpm docs:build
+
+      - name: Create pvzge_web-master.zip
+        run: |
+          mkdir -p pvzge_web-master/docs
+          cp -r pvzg_site/src/.vuepress/dist/* pvzge_web-master/docs/
+          zip -r pvzge_web-master.zip pvzge_web-master/
+
+      - name: Place Assets
+        run: |
+          mkdir -p app/src/main/assets
+          mv pvzge_web-master.zip app/src/main/assets/pvzge_web-master.zip
+
+      - name: Extract Version
+        id: extract-version
+        run: |
+          cd pvzg_site
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          # 尝试从提交消息中提取语义版本号 (格式: "version X.Y.Z")
+          VERSION=$(echo "$COMMIT_MSG" | grep -oP 'version \K\d+\.\d+\.\d+' || true)
+
+          if [ -z "$VERSION" ]; then
+            VERSION=$(git rev-parse --short HEAD)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Commit and Tag
+        run: |
+          VERSION="${{ steps.extract-version.outputs.version }}"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          COMMIT_SHA="${{ steps.get-pvzg-site-commit.outputs.commit_sha }}"
+
+          # 更新最后处理的提交记录
+          echo "$COMMIT_SHA" > last_commit.txt
+          git add last_commit.txt
+          git commit -m "Auto update to $VERSION (pvzg_site ${COMMIT_SHA:0:8})" || echo "No changes to commit"
+
+          # 创建并推送标签
+          if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            TAG_NAME="v$VERSION"
+          else
+            TAG_NAME="commit-$VERSION"
+          fi
+
+          git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+          git push origin main --follow-tags
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+
+      - name: Upload APK Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app/build/outputs/apk/release/app-release.apk
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Build ${{ env.TAG_NAME }}"
+          body: "Auto-generated release for ${{ env.TAG_NAME }}"
+          token: ${{ secrets.GH_TOKEN }}
